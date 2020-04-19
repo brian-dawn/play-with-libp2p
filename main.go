@@ -3,75 +3,113 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
-	"os/signal"
-	"syscall"
+	"time"
 
 	"github.com/libp2p/go-libp2p"
-	peerstore "github.com/libp2p/go-libp2p-core/peer"
-	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
-	multiaddr "github.com/multiformats/go-multiaddr"
+	autonat "github.com/libp2p/go-libp2p-autonat-svc"
+	connmgr "github.com/libp2p/go-libp2p-connmgr"
+	"github.com/libp2p/go-libp2p-core/crypto"
+	"github.com/libp2p/go-libp2p-core/host"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
+	libp2pquic "github.com/libp2p/go-libp2p-quic-transport"
+	routing "github.com/libp2p/go-libp2p-routing"
+	secio "github.com/libp2p/go-libp2p-secio"
+	libp2ptls "github.com/libp2p/go-libp2p-tls"
 )
 
 func main() {
-	// create a background context (i.e. one that never cancels)
-	ctx := context.Background()
+	// The context governs the lifetime of the libp2p node.
+	// Cancelling it will stop the the host.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// start a libp2p node that listens on a random local TCP port,
-	// but without running the built-in ping protocol
-	node, err := libp2p.New(ctx,
-		libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"),
-		libp2p.Ping(false),
+	// To construct a simple host with all the default settings, just use `New`
+	h, err := libp2p.New(ctx)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("Hello World, my hosts ID is %s\n", h.ID())
+
+	// Now, normally you do not just want a simple host, you want
+	// that is fully configured to best support your p2p application.
+	// Let's create a second host setting some more options.
+
+	// Set your own keypair
+	priv, _, err := crypto.GenerateKeyPair(
+		crypto.Ed25519, // Select your key type. Ed25519 are nice short
+		-1,             // Select key length when possible (i.e. RSA).
 	)
 	if err != nil {
 		panic(err)
 	}
 
-	// configure our own ping protocol
-	pingService := &ping.PingService{Host: node}
-	node.SetStreamHandler(ping.ID, pingService.PingHandler)
+	var idht *dht.IpfsDHT
 
-	// print the node's listening addresses
-	fmt.Println("Listen addresses:", node.Addrs())
-
-	// print the node's PeerInfo in multiaddr format
-	peerInfo := peerstore.AddrInfo{
-		ID:    node.ID(),
-		Addrs: node.Addrs(),
-	}
-	addrs, err := peerstore.AddrInfoToP2pAddrs(&peerInfo)
-	fmt.Println("libp2p node address:", addrs[0])
-
-	// if a remote peer has been passed on the command line, connect to it
-	// and send it 5 ping messages, otherwise wait for a signal to stop
-	if len(os.Args) > 1 {
-		addr, err := multiaddr.NewMultiaddr(os.Args[1])
-		if err != nil {
-			panic(err)
-		}
-		peer, err := peerstore.AddrInfoFromP2pAddr(addr)
-		if err != nil {
-			panic(err)
-		}
-		if err := node.Connect(ctx, *peer); err != nil {
-			panic(err)
-		}
-		fmt.Println("sending 5 ping messages to", addr)
-		ch := pingService.Ping(ctx, peer.ID)
-		for i := 0; i < 5; i++ {
-			res := <-ch
-			fmt.Println("got ping response!", "RTT:", res.RTT)
-		}
-	} else {
-		// wait for a SIGINT or SIGTERM signal
-		ch := make(chan os.Signal, 1)
-		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
-		<-ch
-		fmt.Println("Received signal, shutting down...")
-	}
-
-	// shut the node down
-	if err := node.Close(); err != nil {
+	h2, err := libp2p.New(ctx,
+		// Use the keypair we generated
+		libp2p.Identity(priv),
+		// Multiple listen addresses
+		libp2p.ListenAddrStrings(
+			"/ip4/0.0.0.0/tcp/9000",      // regular tcp connections
+			"/ip4/0.0.0.0/udp/9000/quic", // a UDP endpoint for the QUIC transport
+		),
+		// support TLS connections
+		libp2p.Security(libp2ptls.ID, libp2ptls.New),
+		// support secio connections
+		libp2p.Security(secio.ID, secio.New),
+		// support QUIC - experimental
+		libp2p.Transport(libp2pquic.NewTransport),
+		// support any other default transports (TCP)
+		libp2p.DefaultTransports,
+		// Let's prevent our peer from having too many
+		// connections by attaching a connection manager.
+		libp2p.ConnectionManager(connmgr.NewConnManager(
+			100,         // Lowwater
+			400,         // HighWater,
+			time.Minute, // GracePeriod
+		)),
+		// Attempt to open ports using uPNP for NATed hosts.
+		libp2p.NATPortMap(),
+		// Let this host use the DHT to find other hosts
+		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
+			idht, err = dht.New(ctx, h)
+			return idht, err
+		}),
+		// Let this host use relays and advertise itself on relays if
+		// it finds it is behind NAT. Use libp2p.Relay(options...) to
+		// enable active relays and more.
+		libp2p.EnableAutoRelay(),
+	)
+	if err != nil {
 		panic(err)
 	}
+
+	// If you want to help other peers to figure out if they are behind
+	// NATs, you can launch the server-side of AutoNAT too (AutoRelay
+	// already runs the client)
+	_, err = autonat.NewAutoNATService(ctx, h2,
+		// Support same non default security and transport options as
+		// original host.
+		libp2p.Security(libp2ptls.ID, libp2ptls.New),
+		libp2p.Security(secio.ID, secio.New),
+		libp2p.Transport(libp2pquic.NewTransport),
+		libp2p.DefaultTransports,
+	)
+
+	// The last step to get fully up and running would be to connect to
+	// bootstrap peers (or any other peers). We leave this commented as
+	// this is an example and the peer will die as soon as it finishes, so
+	// it is unnecessary to put strain on the network.
+
+	/*
+		// This connects to public bootstrappers
+		for _, addr := range dht.DefaultBootstrapPeers {
+			pi, _ := peer.AddrInfoFromP2pAddr(addr)
+			// We ignore errors as some bootstrap peers may be down
+			// and that is fine.
+			h2.Connect(ctx, *pi)
+		}
+	*/
+	fmt.Printf("Hello World, my second hosts ID is %s\n", h2.ID())
 }
